@@ -148,6 +148,8 @@ def main() -> int:
                 f"daily realised net target USD {settings.daily_profit_target_usd:.2f}; "
                 f"hard equity floor USD {floor:.2f}; stop at balance USD {settings.target_balance_usd:.2f}.")
             print("Demo account only. Every order requires broker-side SL and TP. Ctrl+C stops new entries.")
+            timeframe_seconds = {"M5": 300, "M15": 900, "M30": 1800,
+                "H1": 3600, "H4": 14400, "D1": 86400}[settings.timeframe]
             last_checked_candle = None
             while True:
                 account = client.account_summary()
@@ -162,7 +164,7 @@ def main() -> int:
                 if candle_epoch != last_checked_candle:
                     last_checked_candle = candle_epoch
                     print(f"\nChecking completed candle: {frame.iloc[-2]['time']}")
-                    _try_trade(mt5, client, settings, settings.symbol, candle_epoch + 900)
+                    _try_trade(mt5, client, settings, settings.symbol, candle_epoch + timeframe_seconds)
                 time_module.sleep(settings.poll_seconds)
     except KeyboardInterrupt:
         print("\nDemo trader stopped by user. Any open position retains its broker-side SL/TP.")
