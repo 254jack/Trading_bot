@@ -29,6 +29,11 @@ def generate_signal(frame: pd.DataFrame) -> Signal | None:
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
     rs = gain / loss.where(loss != 0)
     rsi = 100 - (100 / (1 + rs))
+    # Handle zero-loss / zero-gain sequences explicitly. A one-way rise
+    # has RSI 100; a one-way fall has RSI 0; a flat sequence has RSI 50.
+    rsi = rsi.mask((loss == 0) & (gain > 0), 100.0)
+    rsi = rsi.mask((gain == 0) & (loss > 0), 0.0)
+    rsi = rsi.mask((gain == 0) & (loss == 0), 50.0)
 
     previous_close = close.shift(1)
     true_range = pd.concat(
