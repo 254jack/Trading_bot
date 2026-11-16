@@ -1,6 +1,7 @@
 """Opt-in, demo-account-only XAUUSD execution loop."""
 from __future__ import annotations
 from datetime import datetime, time, timezone
+from zoneinfo import ZoneInfo
 import sys
 import time as time_module
 from app.config import load_settings
@@ -13,8 +14,10 @@ COMMENT = "GOLD_DEMO_BOT"
 
 def _daily_net_profit(mt5) -> float:
     """Today's realised net P/L for this bot, including trading costs."""
+    now_local = datetime.now(ZoneInfo("Africa/Nairobi"))
+    local_start = datetime.combine(now_local.date(), time.min, tzinfo=now_local.tzinfo)
+    start = local_start.astimezone(timezone.utc)
     now = datetime.now(timezone.utc)
-    start = datetime.combine(now.date(), time.min, tzinfo=timezone.utc)
     deals = mt5.history_deals_get(start, now)
     if deals is None:
         raise MT5Error(f"Could not read today's deal history: {mt5.last_error()}")
