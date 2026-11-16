@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
 import sys
+import math
 import time as time_module
 from app.config import load_settings
 from app.market_data import rates_to_frame
@@ -35,6 +36,110 @@ def _already_traded_this_candle(mt5, candle_epoch: int) -> bool:
 
 def _normalise_price(price: float, digits: int) -> float:
     return round(price, digits)
+
+
+TRAILING_TRIGGER_USD = 3.00
+TRAILING_GIVEBACK_USD = 3.00
+
+
+def _profit_at_close_price(mt5, position, symbol: str, close_price: float) -> float:
+    order_type = (mt5.ORDER_TYPE_BUY if position.type == mt5.POSITION_TYPE_BUY
+        else mt5.ORDER_TYPE_SELL)
+    result = mt5.order_calc_profit(
+        order_type, symbol, float(position.volume), float(position.price_open), close_price)
+    if result is None:
+        raise MT5Error(f"Could not calculate trailing-stop P/L: {mt5.last_error()}")
+    value = float(result)
+    if not math.isfinite(value):
+        raise MT5Error("Broker returned a non-finite trailing-stop P/L")
+    return value
+
+
+def _trailing_stop_price(mt5, position, symbol: str, tick, info,
+                         target_profit: float) -> float | None:
+    """Find a broker-calculated stop price that locks at least target_profit USD."""
+    digits = int(info.digits)
+    min_distance = float(getattr(info, "trade_stops_level", 0)) * float(info.point)
+    if position.type == mt5.POSITION_TYPE_BUY:
+        low = float(position.price_open)
+        high = float(tick.bid) - min_distance
+        if high <= low:
+            return None
+        if _profit_at_close_price(mt5, position, symbol, high) < target_profit:
+            return None
+        for _ in range(60):
+            mid = (low + high) / 2
+            if _profit_at_close_price(mt5, position, symbol, mid) >= target_profit:
+                high = mid
+            else:
+                low = mid
+        candidate = _normalise_price(high, digits)
+        if candidate > float(tick.bid) - min_distance + float(info.point) / 2:
+            return None
+    else:
+        low = float(tick.ask) + min_distance
+        high = float(position.price_open)
+        if low >= high:
+            return None
+        if _profit_at_close_price(mt5, position, symbol, low) < target_profit:
+            return None
+        for _ in range(60):
+            mid = (low + high) / 2
+            if _profit_at_close_price(mt5, position, symbol, mid) >= target_profit:
+                low = mid
+            else:
+                high = mid
+        candidate = _normalise_price(low, digits)
+        if candidate < float(tick.ask) + min_distance - float(info.point) / 2:
+            return None
+    if _profit_at_close_price(mt5, position, symbol, candidate) + 1e-8 < target_profit:
+        return None
+    return candidate
+
+
+def _manage_trailing_stops(mt5, symbol: str) -> None:
+    """After +$3 floating P/L, trail the broker-side SL at a $3 cash distance."""
+    positions = mt5.positions_get(symbol=symbol)
+    if positions is None:
+        raise MT5Error(f"Could not inspect positions for trailing stops: {mt5.last_error()}")
+    owned = [p for p in positions if getattr(p, "magic", None) == MAGIC]
+    if not owned:
+        return
+    info = mt5.symbol_info(symbol)
+    tick = mt5.symbol_info_tick(symbol)
+    if info is None or tick is None:
+        raise MT5Error(f"Missing symbol/tick data for trailing stop: {mt5.last_error()}")
+    for position in owned:
+        floating_profit = float(getattr(position, "profit", 0.0))
+        if floating_profit < TRAILING_TRIGGER_USD:
+            continue
+        # A $3 cash trailing distance means breakeven at the +$3 trigger,
+        # then progressively more locked-in profit as the trade moves further.
+        lock_target = max(0.0, floating_profit - TRAILING_GIVEBACK_USD)
+        new_stop = _trailing_stop_price(mt5, position, symbol, tick, info, lock_target)
+        if new_stop is None:
+            print(f"TRAILING WAIT: ticket={position.ticket}; +{floating_profit:.2f} USD reached, "
+                  "but broker stop-distance rules do not yet allow the protective stop.")
+            continue
+        old_stop = float(getattr(position, "sl", 0.0))
+        point = float(info.point)
+        improves = (new_stop > old_stop + point / 2 if position.type == mt5.POSITION_TYPE_BUY
+            else old_stop == 0.0 or new_stop < old_stop - point / 2)
+        if not improves:
+            continue
+        request = {"action": mt5.TRADE_ACTION_SLTP, "symbol": symbol,
+            "position": int(position.ticket), "sl": new_stop,
+            "tp": float(getattr(position, "tp", 0.0))}
+        result = mt5.order_send(request)
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            print(f"TRAILING UPDATE FAILED: ticket={position.ticket}; "
+                  f"response={getattr(result, 'comment', None) or mt5.last_error()}")
+            continue
+        locked = _profit_at_close_price(mt5, position, symbol, new_stop)
+        print(f"TRAILING STOP UPDATED: ticket={position.ticket}; floating=+{floating_profit:.2f} USD; "
+              f"SL={new_stop:.{int(info.digits)}f}; approx. price P/L protected=+{locked:.2f} USD; "
+              f"TP retained={float(getattr(position, 'tp', 0.0)):.{int(info.digits)}f}")
+
 
 def _filling_mode(mt5, info):
     flags = int(getattr(info, "filling_mode", 0))
@@ -173,6 +278,7 @@ def main() -> int:
             last_checked_candle = None
             while True:
                 account = client.account_summary()
+                _manage_trailing_stops(mt5, symbol)
                 if account["equity"] <= floor:
                     print(f"MAXIMUM CUMULATIVE LOSS REACHED: equity {account['equity']:.2f}; floor {floor:.2f}. Bot stopped.")
                     break
