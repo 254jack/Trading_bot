@@ -1,58 +1,75 @@
 # Gold Trading Bot (XAU/USD)
 
-A risk-first, Python-based gold trading system connected to MetaTrader 5.
+A risk-first Python trading system connected to MetaTrader 5.
 
-## Current stage
+## Current stages
 
-**Milestone 1: MT5 connectivity and market-data foundation.** This version is read-only: it connects to an already-running MT5 desktop terminal, inspects the account and XAUUSD symbol, and retrieves candles. It does not submit, modify, or close orders.
+- MT5 account and market-data connectivity.
+- Closed-candle EMA/RSI/ATR strategy research.
+- Opt-in demo execution with broker-side stop-loss and take-profit.
+- Historical backtesting and forward-demo evaluation remain necessary before any live-money consideration.
 
-## Safety defaults
+## Demo execution safety
 
-- Demo account is required for development.
-- Order execution is not implemented or enabled.
-- No credentials are stored in source control.
-- A signal is not an instruction to trade.
-- Position sizing rejects trades below the broker's minimum volume when the requested cash risk cannot be respected.
+The bot will only submit orders when **both** `TRADING_MODE=DEMO` and `ENABLE_DEMO_TRADING=true` are set. It independently verifies that MT5 identifies the connected account as a demo account. The read-only diagnostic command remains `python -m app.main`; the separate execution command is `python -m app.demo_trader`.
+
+Initial limits: maximum 0.5% estimated equity risk per trade, 1% daily realised-loss stop, one position on the gold symbol, spread filter, one entry per candle, mandatory stop-loss and take-profit. Trades below broker minimum volume are rejected rather than rounded up. No martingale, grid, averaging down, or forced entries.
+
+These controls reduce risk but do not guarantee profits or prevent slippage, gaps, rejected stops, terminal/network failures, or losses. Demo results do not predict live performance. Keep the terminal on a demo account and stop the process with Ctrl+C whenever you want.
 
 ## Requirements
 
 - Windows 10/11
-- MetaTrader 5 desktop terminal installed and logged in
-- Python 3.10–3.13 (use a version supported by the installed MetaTrader5 package)
-- A broker-provided demo account with XAUUSD enabled
+- MetaTrader 5 desktop terminal installed and logged into a broker demo account
+- Python version supported by the installed MetaTrader5 package (Python 3.12 is a tested package target)
+- XAUUSD available in Market Watch
 
 ## Setup (PowerShell)
 
 ```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
+py -3.12 -m venv env
+.\env\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Open MT5, log into a **demo** account, ensure the gold instrument is visible in Market Watch, then run:
+Open MT5, log into a **demo** account, and ensure gold is visible in Market Watch. Set the exact symbol name in `.env` if your broker uses a suffix.
+
+Run diagnostics (read-only):
 
 ```powershell
 python -m app.main
 ```
 
-If your broker uses a suffix (for example `XAUUSDm` or `XAUUSD.`), set `MT5_SYMBOL` in `.env` to the exact Market Watch symbol.
+To explicitly opt into demo execution, edit `.env` and set:
 
-## Configuration
+```env
+TRADING_MODE=DEMO
+ENABLE_DEMO_TRADING=true
+REQUIRE_DEMO_ACCOUNT=true
+```
 
-See `.env.example`. Leave `MT5_PATH` blank to use the default terminal installation. Never commit `.env`, account passwords, investor passwords, or API tokens.
+Then run:
+
+```powershell
+python -m app.demo_trader
+```
+
+The process monitors closed M15 candles and checks for a signal. It does not promise a trade on demand; no-trade is a valid outcome. Keep MT5 open and connected. Press Ctrl+C to stop the bot.
+
+## Strategy
+
+The initial experimental strategy uses EMA 20/50 trend alignment, RSI 14 momentum confirmation, and ATR 14 for stop distance. It trades only on a completed candle. Initial exits target 2R against a 1.5 ATR stop. This is a testable starting hypothesis, not a proven profitable strategy.
 
 ## Project layout
 
-- `app/mt5_client.py`: MT5 connection, account/symbol diagnostics and candle retrieval.
+- `app/mt5_client.py`: MT5 connection and account/symbol/candle diagnostics.
 - `app/market_data.py`: normalized OHLCV data.
-- `app/risk.py`: cash-risk position sizing using broker contract metadata.
-- `app/main.py`: read-only diagnostic entry point.
-- `tests/`: offline tests that do not require MT5.
+- `app/risk.py`: broker-metadata-based position sizing.
+- `app/strategy.py`: closed-candle signal calculation.
+- `app/demo_trader.py`: guarded demo-only execution loop.
+- `app/main.py`: read-only diagnostics.
+- `tests/`: offline tests.
 
-## Risk policy to validate before any future execution milestone
-
-Initial research settings only: 0.25%–0.5% risk per trade, 1% daily loss stop, one open position, no martingale, no averaging down. These are not guarantees and must be tested against the broker's actual contract size, tick value, minimum volume, spread, commission and slippage.
-
-**No live trading will be added until historical testing, demo forward testing, and explicit approval are complete.**
+Never commit `.env`, account passwords, investor passwords, or API tokens. No live trading mode is implemented.
