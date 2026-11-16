@@ -1,6 +1,7 @@
 """Risk calculations only; this module never sends orders."""
 from dataclasses import dataclass
 import math
+from collections.abc import Callable
 @dataclass(frozen=True)
 class PositionSizeResult:
     accepted: bool
@@ -41,3 +42,38 @@ def calculate_position_size(*, equity: float, risk_fraction: float, entry_price:
     if estimated_risk > cash_risk + 1e-8:
         return PositionSizeResult(False, 0.0, estimated_risk, "Rounded volume exceeds risk budget")
     return PositionSizeResult(True, volume, estimated_risk, "Position fits configured cash risk budget")
+
+
+
+def calculate_position_size_from_profit(*, volume_min: float, volume_max: float,
+    volume_step: float, risk_budget_cash: float,
+    loss_at_stop: Callable[[float], float]) -> PositionSizeResult:
+    """Size using the broker's own P/L calculator for each candidate volume.
+
+    loss_at_stop(volume) must return the positive cash loss at the stop price
+    in the trading account currency. The caller must reject unavailable or
+    non-loss results rather than substituting tick-value estimates.
+    """
+    values = (volume_min, volume_max, volume_step, risk_budget_cash)
+    if not all(math.isfinite(float(v)) for v in values):
+        return PositionSizeResult(False, 0.0, 0.0, "Non-finite broker sizing input")
+    if volume_min <= 0 or volume_max < volume_min or volume_step <= 0 or risk_budget_cash <= 0:
+        return PositionSizeResult(False, 0.0, 0.0, "Invalid broker volume or cash risk specification")
+
+    max_steps = math.floor((volume_max - volume_min) / volume_step + 1e-9)
+    min_loss = None
+    for step_index in range(max_steps, -1, -1):
+        volume = round(volume_min + step_index * volume_step, 8)
+        try:
+            loss = float(loss_at_stop(volume))
+        except Exception:
+            return PositionSizeResult(False, 0.0, 0.0, "Broker profit calculator failed")
+        if not math.isfinite(loss) or loss <= 0:
+            return PositionSizeResult(False, 0.0, 0.0, "Broker profit calculator returned invalid stop-loss result")
+        if volume == round(volume_min, 8):
+            min_loss = loss
+        if loss <= risk_budget_cash + 1e-8:
+            return PositionSizeResult(True, volume, loss, "Position fits broker-calculated cash risk budget")
+
+    return PositionSizeResult(False, 0.0, float(min_loss or 0.0),
+        f"Broker minimum volume {volume_min:g} risks {float(min_loss or 0.0):.2f}, above the {risk_budget_cash:.2f} per-trade limit")
