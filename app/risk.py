@@ -48,7 +48,7 @@ def calculate_position_size(*, equity: float, risk_fraction: float, entry_price:
 def calculate_position_size_from_profit(*, volume_min: float, volume_max: float,
     volume_step: float, risk_budget_cash: float,
     loss_at_stop: Callable[[float], float]) -> PositionSizeResult:
-    """Size using the broker's own P/L calculator for each candidate volume.
+    """Size using the broker's own P/L calculator for candidate volumes.
 
     loss_at_stop(volume) must return the positive cash loss at the stop price
     in the trading account currency. The caller must reject unavailable or
@@ -61,19 +61,33 @@ def calculate_position_size_from_profit(*, volume_min: float, volume_max: float,
         return PositionSizeResult(False, 0.0, 0.0, "Invalid broker volume or cash risk specification")
 
     max_steps = math.floor((volume_max - volume_min) / volume_step + 1e-9)
-    min_loss = None
-    for step_index in range(max_steps, -1, -1):
-        volume = round(volume_min + step_index * volume_step, 8)
-        try:
-            loss = float(loss_at_stop(volume))
-        except Exception:
-            return PositionSizeResult(False, 0.0, 0.0, "Broker profit calculator failed")
-        if not math.isfinite(loss) or loss <= 0:
-            return PositionSizeResult(False, 0.0, 0.0, "Broker profit calculator returned invalid stop-loss result")
-        if volume == round(volume_min, 8):
-            min_loss = loss
-        if loss <= risk_budget_cash + 1e-8:
-            return PositionSizeResult(True, volume, loss, "Position fits broker-calculated cash risk budget")
 
-    return PositionSizeResult(False, 0.0, float(min_loss or 0.0),
-        f"Broker minimum volume {volume_min:g} risks {float(min_loss or 0.0):.2f}, above the {risk_budget_cash:.2f} per-trade limit")
+    def checked_loss(volume: float) -> float:
+        loss = float(loss_at_stop(volume))
+        if not math.isfinite(loss) or loss <= 0:
+            raise ValueError("Broker profit calculator returned an invalid stop-loss result")
+        return loss
+
+    try:
+        min_loss = checked_loss(volume_min)
+        if min_loss > risk_budget_cash + 1e-8:
+            return PositionSizeResult(False, 0.0, min_loss,
+                f"Broker minimum volume {volume_min:g} risks {min_loss:.2f}, above the {risk_budget_cash:.2f} per-trade limit")
+
+        low, high = 0, max_steps
+        best_volume, best_loss = volume_min, min_loss
+        # Broker P/L is monotonic with volume for a fixed symbol and price.
+        while low <= high:
+            mid = (low + high) // 2
+            volume = round(volume_min + mid * volume_step, 8)
+            loss = checked_loss(volume)
+            if loss <= risk_budget_cash + 1e-8:
+                best_volume, best_loss = volume, loss
+                low = mid + 1
+            else:
+                high = mid - 1
+    except Exception:
+        return PositionSizeResult(False, 0.0, 0.0, "Broker profit calculator failed or returned invalid data")
+
+    return PositionSizeResult(True, best_volume, best_loss,
+        "Position fits broker-calculated cash risk budget")
