@@ -144,9 +144,10 @@ def main() -> int:
                 raise MT5Error("Hard safety stop: MT5 does not identify this as a demo account.")
             if account["currency"] != "USD":
                 raise MT5Error(f"This small-account plan requires a USD account, not {account['currency']}.")
+            symbol = client.resolve_symbol(settings.symbol)
             floor = settings.starting_balance_usd - settings.max_cumulative_loss_usd
             print(f"DEMO TRADING ACTIVE | server={account['server']} | balance={account['balance']:.2f} "
-                f"| equity={account['equity']:.2f} USD | symbol={settings.symbol} | timeframe={settings.timeframe}")
+                f"| equity={account['equity']:.2f} USD | symbol={symbol} | timeframe={settings.timeframe}")
             print(f"Small-account plan: max trade risk USD {settings.max_trade_risk_usd:.2f}; "
                 f"daily realised net target USD {settings.daily_profit_target_usd:.2f}; "
                 f"hard equity floor USD {floor:.2f}; stop at balance USD {settings.target_balance_usd:.2f}.")
@@ -162,12 +163,12 @@ def main() -> int:
                 if account["balance"] >= settings.target_balance_usd:
                     print(f"GROWTH TARGET REACHED: balance {account['balance']:.2f} USD. Bot stopped.")
                     break
-                frame = rates_to_frame(client.candles(settings.symbol, settings.timeframe, settings.candle_count))
+                frame = rates_to_frame(client.candles(symbol, settings.timeframe, settings.candle_count))
                 candle_epoch = int(frame.iloc[-2]["time"].timestamp())
                 if candle_epoch != last_checked_candle:
                     last_checked_candle = candle_epoch
                     print(f"\nChecking completed candle: {frame.iloc[-2]['time']}")
-                    _try_trade(mt5, client, settings, settings.symbol, candle_epoch + timeframe_seconds)
+                    _try_trade(mt5, client, settings, symbol, candle_epoch + timeframe_seconds)
                 time_module.sleep(settings.poll_seconds)
     except KeyboardInterrupt:
         print("\nDemo trader stopped by user. Any open position retains its broker-side SL/TP.")
