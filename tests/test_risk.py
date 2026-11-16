@@ -1,4 +1,4 @@
-from app.risk import calculate_position_size
+from app.risk import calculate_position_size, calculate_position_size_from_profit
 
 
 def test_rejects_trade_when_minimum_volume_exceeds_risk_budget():
@@ -54,3 +54,35 @@ def test_cash_risk_budget_never_rounds_up_to_minimum_lot():
     assert result.accepted is False
     assert result.volume == 0
     assert result.estimated_risk > 5.00
+
+
+
+def test_broker_profit_sizing_uses_exact_cash_loss_and_respects_budget():
+    result = calculate_position_size_from_profit(
+        volume_min=0.01, volume_max=1.0, volume_step=0.01,
+        risk_budget_cash=5.0,
+        loss_at_stop=lambda volume: volume * 400.0,
+    )
+    assert result.accepted is True
+    assert result.volume == 0.01
+    assert result.estimated_risk == 4.0
+
+
+def test_broker_profit_sizing_rejects_minimum_lot_over_budget():
+    result = calculate_position_size_from_profit(
+        volume_min=0.01, volume_max=1.0, volume_step=0.01,
+        risk_budget_cash=5.0,
+        loss_at_stop=lambda volume: volume * 600.0,
+    )
+    assert result.accepted is False
+    assert result.volume == 0.0
+    assert result.estimated_risk == 6.0
+
+
+def test_broker_profit_sizing_rejects_invalid_calculator_result():
+    result = calculate_position_size_from_profit(
+        volume_min=0.01, volume_max=1.0, volume_step=0.01,
+        risk_budget_cash=5.0,
+        loss_at_stop=lambda volume: 0.0,
+    )
+    assert result.accepted is False
