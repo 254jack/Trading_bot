@@ -38,8 +38,8 @@ def _normalise_price(price: float, digits: int) -> float:
     return round(price, digits)
 
 
-TRAILING_TRIGGER_USD = 3.00
-TRAILING_GIVEBACK_USD = 3.00
+TRAILING_TRIGGER_USD = 2.00
+TRAILING_GIVEBACK_USD = 1.00
 
 
 def _profit_at_close_price(mt5, position, symbol: str, close_price: float) -> float:
@@ -98,7 +98,11 @@ def _trailing_stop_price(mt5, position, symbol: str, tick, info,
 
 
 def _manage_trailing_stops(mt5, symbol: str) -> None:
-    """After +$3 floating P/L, trail the broker-side SL at a $3 cash distance."""
+    """After +$2 floating P/L, trail the broker-side SL with a $1 cash giveback.
+
+    No fixed take-profit is used: the stop progressively locks more profit
+    while allowing a winning position to continue running.
+    """
     positions = mt5.positions_get(symbol=symbol)
     if positions is None:
         raise MT5Error(f"Could not inspect positions for trailing stops: {mt5.last_error()}")
@@ -113,8 +117,8 @@ def _manage_trailing_stops(mt5, symbol: str) -> None:
         floating_profit = float(getattr(position, "profit", 0.0))
         if floating_profit < TRAILING_TRIGGER_USD:
             continue
-        # A $3 cash trailing distance means breakeven at the +$3 trigger,
-        # then progressively more locked-in profit as the trade moves further.
+        # At +$2, aim to protect +$1; increase the protected amount as
+        # floating profit grows, while keeping the broker-side TP disabled.
         lock_target = max(0.0, floating_profit - TRAILING_GIVEBACK_USD)
         new_stop = _trailing_stop_price(mt5, position, symbol, tick, info, lock_target)
         if new_stop is None:
@@ -138,7 +142,7 @@ def _manage_trailing_stops(mt5, symbol: str) -> None:
         locked = _profit_at_close_price(mt5, position, symbol, new_stop)
         print(f"TRAILING STOP UPDATED: ticket={position.ticket}; floating=+{floating_profit:.2f} USD; "
               f"SL={new_stop:.{int(info.digits)}f}; approx. price P/L protected=+{locked:.2f} USD; "
-              f"TP retained={float(getattr(position, 'tp', 0.0)):.{int(info.digits)}f}")
+              "fixed TP disabled.")
 
 
 def _filling_mode(mt5, info):
@@ -187,9 +191,7 @@ def _try_trade(mt5, client, settings, symbol: str, last_candle_epoch: int) -> No
     is_buy = signal.side == "BUY"
     entry = float(tick.ask if is_buy else tick.bid)
     stop_distance = signal.atr * 0.5
-    target_distance = stop_distance * 2.0
     stop = entry - stop_distance if is_buy else entry + stop_distance
-    target = entry + target_distance if is_buy else entry - target_distance
     # $5 max estimated risk per position, further capped by remaining room above $20.
     remaining_loss = account["equity"] - floor
     cash_budget = min(settings.max_trade_risk_usd, remaining_loss)
@@ -215,24 +217,21 @@ def _try_trade(mt5, client, settings, symbol: str, last_candle_epoch: int) -> No
         print(f"REJECTED: {size.reason}. No order was sent.")
         return
     digits = int(info.digits)
-    stop, target = _normalise_price(stop, digits), _normalise_price(target, digits)
+    stop = _normalise_price(stop, digits)
     min_stop = float(getattr(info, "trade_stops_level", 0)) * float(info.point)
-    if abs(entry - stop) < min_stop or abs(target - entry) < min_stop:
-        print("REJECTED: calculated stop/target is inside the broker's minimum stop distance.")
+    if abs(entry - stop) < min_stop:
+        print("REJECTED: calculated stop is inside the broker's minimum stop distance.")
         return
     # Independently verify both monetary outcomes with the broker calculator.
     verified_risk = broker_stop_loss_cash(size.volume)
     if verified_risk > cash_budget + 1e-8:
         print(f"REJECTED: broker-calculated stop risk {verified_risk:.2f} exceeds budget {cash_budget:.2f}.")
         return
-    broker_tp_result = mt5.order_calc_profit(order_type, symbol, size.volume, entry, target)
-    if broker_tp_result is None or float(broker_tp_result) <= 0:
-        print("REJECTED: broker could not verify a positive take-profit outcome.")
-        return
-
+    # TP=0 disables a fixed broker-side take-profit. The trailing manager
+    # progressively adjusts the broker-side SL as the position gains.
     request = {"action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": size.volume,
         "type": order_type,
-        "price": _normalise_price(entry, digits), "sl": stop, "tp": target,
+        "price": _normalise_price(entry, digits), "sl": stop, "tp": 0.0,
         "deviation": 30, "magic": MAGIC, "comment": COMMENT,
         "type_time": mt5.ORDER_TIME_GTC, "type_filling": _filling_mode(mt5, info)}
     checked = mt5.order_check(request)
@@ -247,8 +246,8 @@ def _try_trade(mt5, client, settings, symbol: str, last_candle_epoch: int) -> No
         print(f"ORDER REJECTED: retcode={result.retcode}, comment={result.comment}")
         return
     print(f"DEMO ORDER {signal.side} accepted: ticket={result.order}, volume={size.volume:.2f}, "
-        f"entry={entry:.{digits}f}, SL={stop:.{digits}f}, TP={target:.{digits}f}, "
-        f"broker-calculated risk={verified_risk:.2f} USD, broker-calculated TP={float(broker_tp_result):.2f} USD. Daily net={daily_profit:.2f}; "
+        f"entry={entry:.{digits}f}, SL={stop:.{digits}f}, fixed TP=disabled, "
+        f"broker-calculated risk={verified_risk:.2f} USD. Daily net={daily_profit:.2f}; "
         f"daily target={settings.daily_profit_target_usd:.2f}. Signal: {signal.reason}")
 
 def main() -> int:
@@ -272,7 +271,8 @@ def main() -> int:
             print(f"Small-account plan: max trade risk USD {settings.max_trade_risk_usd:.2f}; "
                 f"daily realised net target USD {settings.daily_profit_target_usd:.2f}; "
                 f"hard equity floor USD {floor:.2f}; stop at balance USD {settings.target_balance_usd:.2f}.")
-            print("Demo account only. Every order requires broker-side SL and TP. Ctrl+C stops new entries.")
+            print("Demo account only. Every order requires a broker-side SL; fixed TP is disabled. "
+                  "Trailing protection starts at +$2 floating profit with a $1 giveback. Ctrl+C stops new entries.")
             timeframe_seconds = {"M5": 300, "M15": 900, "M30": 1800,
                 "H1": 3600, "H4": 14400, "D1": 86400}[settings.timeframe]
             last_checked_candle = None
@@ -293,7 +293,8 @@ def main() -> int:
                     _try_trade(mt5, client, settings, symbol, candle_epoch + timeframe_seconds)
                 time_module.sleep(settings.poll_seconds)
     except KeyboardInterrupt:
-        print("\nDemo trader stopped by user. Any open position retains its broker-side SL/TP.")
+        print("\nDemo trader stopped by user. Any open position retains its broker-side SL; "
+              "the bot's trailing management stops until restarted.")
         return 0
     except (MT5Error, ValueError, RuntimeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
