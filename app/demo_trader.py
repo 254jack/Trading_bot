@@ -7,7 +7,7 @@ import time as time_module
 from app.config import load_settings
 from app.market_data import rates_to_frame
 from app.mt5_client import MT5Client, MT5Error
-from app.risk import calculate_position_size
+from app.risk import calculate_position_size_from_profit
 from app.strategy import generate_signal
 MAGIC = 26111601
 COMMENT = "GOLD_DEMO_BOT"
@@ -81,25 +81,31 @@ def _try_trade(mt5, client, settings, symbol: str, last_candle_epoch: int) -> No
         return
     is_buy = signal.side == "BUY"
     entry = float(tick.ask if is_buy else tick.bid)
-    stop_distance = signal.atr * 1.5
+    stop_distance = signal.atr * 0.5
     target_distance = stop_distance * 2.0
     stop = entry - stop_distance if is_buy else entry + stop_distance
     target = entry + target_distance if is_buy else entry - target_distance
-    tick_size = float(info.trade_tick_size)
-    tick_value = float(getattr(info, "trade_tick_value_loss", 0.0) or info.trade_tick_value)
-    if tick_size <= 0 or tick_value <= 0:
-        print("REJECTED: broker tick size/value is unavailable.")
-        return
     # $5 max estimated risk per position, further capped by remaining room above $20.
     remaining_loss = account["equity"] - floor
     cash_budget = min(settings.max_trade_risk_usd, remaining_loss)
     if cash_budget <= 0:
         print("MAXIMUM CUMULATIVE LOSS REACHED: no risk budget remains.")
         raise SystemExit(0)
-    size = calculate_position_size(equity=account["equity"], risk_fraction=0.005,
-        entry_price=entry, stop_price=stop, tick_size=tick_size, tick_value_per_lot=tick_value,
+    order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
+
+    def broker_stop_loss_cash(candidate_volume: float) -> float:
+        result = mt5.order_calc_profit(order_type, symbol, candidate_volume, entry, stop)
+        if result is None:
+            raise RuntimeError(f"MT5 order_calc_profit failed: {mt5.last_error()}")
+        result = float(result)
+        if not result < 0:
+            raise RuntimeError(f"MT5 returned a non-loss value for the stop price: {result}")
+        return abs(result)
+
+    size = calculate_position_size_from_profit(
         volume_min=float(info.volume_min), volume_max=float(info.volume_max),
-        volume_step=float(info.volume_step), risk_budget_cash=cash_budget)
+        volume_step=float(info.volume_step), risk_budget_cash=cash_budget,
+        loss_at_stop=broker_stop_loss_cash)
     if not size.accepted:
         print(f"REJECTED: {size.reason}. No order was sent.")
         return
@@ -109,8 +115,18 @@ def _try_trade(mt5, client, settings, symbol: str, last_candle_epoch: int) -> No
     if abs(entry - stop) < min_stop or abs(target - entry) < min_stop:
         print("REJECTED: calculated stop/target is inside the broker's minimum stop distance.")
         return
+    # Independently verify both monetary outcomes with the broker calculator.
+    verified_risk = broker_stop_loss_cash(size.volume)
+    if verified_risk > cash_budget + 1e-8:
+        print(f"REJECTED: broker-calculated stop risk {verified_risk:.2f} exceeds budget {cash_budget:.2f}.")
+        return
+    broker_tp_result = mt5.order_calc_profit(order_type, symbol, size.volume, entry, target)
+    if broker_tp_result is None or float(broker_tp_result) <= 0:
+        print("REJECTED: broker could not verify a positive take-profit outcome.")
+        return
+
     request = {"action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": size.volume,
-        "type": mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL,
+        "type": order_type,
         "price": _normalise_price(entry, digits), "sl": stop, "tp": target,
         "deviation": 30, "magic": MAGIC, "comment": COMMENT,
         "type_time": mt5.ORDER_TIME_GTC, "type_filling": _filling_mode(mt5, info)}
@@ -127,7 +143,7 @@ def _try_trade(mt5, client, settings, symbol: str, last_candle_epoch: int) -> No
         return
     print(f"DEMO ORDER {signal.side} accepted: ticket={result.order}, volume={size.volume:.2f}, "
         f"entry={entry:.{digits}f}, SL={stop:.{digits}f}, TP={target:.{digits}f}, "
-        f"estimated risk={size.estimated_risk:.2f} USD. Daily net={daily_profit:.2f}; "
+        f"broker-calculated risk={verified_risk:.2f} USD, broker-calculated TP={float(broker_tp_result):.2f} USD. Daily net={daily_profit:.2f}; "
         f"daily target={settings.daily_profit_target_usd:.2f}. Signal: {signal.reason}")
 
 def main() -> int:
